@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mk_names.py - build an id -> path map (names.txt) for harvested NPK TOCs.
+
+NPK entries store no file names, only a 32-bit id = murmur3_32(relative_path_with_backslashes,
+seed 0x9747B28C).  If you have any list of asset paths (game logs, extracted XML/JSON that
+reference other assets, a community path list, ...), this script hashes each candidate path and
+keeps the ones that exist in the harvested TOCs, writing a `names.txt` that npk_unpack.py can
+consume via --names.
+
+Usage:
+    python mk_names.py --out names.txt --toc-dir toc --logs D:\\FeverApps\\party_pc\\filetrace.log D:\\FeverApps\\party_pc\\log.txt
+    python mk_names.py --out names.txt --toc-dir toc --text-dir out\\gui2_text
+    python mk_names.py --out names.txt --toc-dir toc --paths my_path_list.txt
+
+names.txt format:   <id-hex>\t<relative/path.ext>
+"""
+import argparse
+import os
+import re
+import struct
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+RE_PATH = re.compile(
+    rb"[A-Za-z0-9_][A-Za-z0-9_\-/\\\.\x20]{2,160}\."
+    rb"(?:kta|ktx2|ktx|scn|gim|mtg|lod|anim|rawanimation|blendspace1d|trackgroup|animgraph|"
+    rb"skeleton|xml|json|txt|bnk|wem|png|dds|nxs|sfx|shader|mat|spline|prefab|pyc|py|node|kv)\b")
+
+
+def murmur3_32(data, seed=0x9747B28C):
+    c1, c2 = 0xCC9E2D51, 0x1B873593
+    h = seed
+    n = len(data)
+    nblocks = n // 4
+    for i in range(nblocks):
+        k = struct.unpack_from("<I", data, i * 4)[0]
+        k = (k * c1) & 0xFFFFFFFF
+        k = ((k << 15) | (k >> 17)) & 0xFFFFFFFF
+        k = (k * c2) & 0xFFFFFFFF
+        h ^= k
+        h = ((h << 13) | (h >> 19)) & 0xFFFFFFFF
+        h = (h * 5 + 0xE6546B64) & 0xFFFFFFFF
+    k = 0
+    tail = data[nblocks * 4:]
+    if len(tail) >= 3:
+        k ^= tail[2] << 16
+    if len(tail) >= 2:
+        k ^= tail[1] << 8
+    if len(tail) >= 1:
+        k ^= tail[0]
+        k = (k * c1) & 0xFFFFFFFF
+        k = ((k << 15) | (k >> 17)) & 0xFFFFFFFF
+        k = (k * c2) & 0xFFFFFFFF
+        h ^= k
+    h ^= n
+    h ^= h >> 16
+    h = (h * 0x85EBCA6B) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * 0xC2B2AE35) & 0xFFFFFFFF
+    h ^= h >> 16
+    return h
+
+
+def load_toc_ids(toc_dir):
+    ids = {}
+    if not os.path.isdir(toc_dir):
+        return ids
+    for name in os.listdir(toc_dir):
+        if not name.startswith("toc_") or not name.endswith(".bin"):
+            continue
+        data = open(os.path.join(toc_dir, name), "rb").read()
+        for i in range(len(data) // 28):
+            ids[struct.unpack_from("<I", data, i * 28)[0]] = name[4:-4]
+    return ids
+
+
+def scrape_file(path, blobs):
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        return
+    blobs.append(data)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--toc-dir", default=os.path.join(_HERE, "toc"))
+    ap.add_argument("--out", default=os.path.join(_HERE, "names.txt"))
+    ap.add_argument("--logs", nargs="*", default=[])
+    ap.add_argument("--text-dir", nargs="*", default=[])
+    ap.add_argument("--paths", nargs="*", default=[],
+                    help="plain text files with one candidate path per line")
+    ap.add_argument("--extra-prefixes", nargs="*", default=[""],
+                    help="path prefixes to try for relative candidates, e.g. gui2/ res/")
+    args = ap.parse_args()
+
+    ids = load_toc_ids(args.toc_dir)
+    print("known ids: %d from %s" % (len(ids), args.toc_dir))
+
+    blobs = []
+    for p in args.logs:
+        scrape_file(p, blobs)
+    for d in args.text_dir:
+        if os.path.isdir(d):
+            for root, _, files in os.walk(d):
+                for fn in files:
+                    scrape_file(os.path.join(root, fn), blobs)
+    candidates = set()
+    for b in blobs:
+        for m in RE_PATH.finditer(b):
+            for part in m.group(0).replace(b",", b" ").split():
+                candidates.add(part.decode("latin1"))
+    for p in args.paths:
+        try:
+            for line in open(p, "r", encoding="utf-8", errors="ignore"):
+                line = line.strip().strip('"\'')
+                if line and ("/" in line or "\\" in line):
+                    candidates.add(line)
+        except OSError:
+            pass
+    print("candidate paths: %d" % len(candidates))
+
+    variants = set()
+    for c in candidates:
+        c = c.strip().lstrip("/\\")
+        base = c.replace("/", "\\")
+        for v in (base, base.lower(), c, c.lower()):
+            variants.add(v)
+        for pref in args.extra_prefixes:
+            for v in (base, base.lower()):
+                variants.add(pref + v)
+    print("hash variants: %d" % len(variants))
+
+    names = {}
+    for v in variants:
+        b = v.encode("latin1", "ignore")
+        h = murmur3_32(b)
+        if h in ids:
+            names.setdefault(h, v)
+    print("matched: %d" % len(names))
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write("# id\tpath  (generated by mk_names.py)\n")
+        for h in sorted(names):
+            f.write("%08x\t%s\n" % (h, names[h]))
+    print("wrote", args.out)
+    per_npk = {}
+    for h in names:
+        per_npk[ids[h]] = per_npk.get(ids[h], 0) + 1
+    for k in sorted(per_npk):
+        print("  %-16s %d" % (k, per_npk[k]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
